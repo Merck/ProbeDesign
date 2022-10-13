@@ -1,0 +1,256 @@
+---
+title: "ProbeDesign Template"
+output: html_notebook
+---
+# Defining project parameters
+```{r}
+# Name of the project folder you want to work in, should contain your fastq/a input file
+project <- "Test"
+# the name of your input fasta/q file
+unaligned.file <- "All7_unaligned.fasta" 
+# what you want to name the aligned file 
+aligned.file <- "All7_aligned.fasta"
+# write in if you have a fasta or fastq file, in all caps
+Format <- "FASTA" 
+
+the_identifier <- "Bacteria" # a common, general identifier for probe design below
+
+# PROBE REQUIREMENTS FOR FILTERING: 
+# FAm (formamide melting point) less than or equal to 46, but more than or equal to 30. This should allow for probe hybridization at 20% formamide and 46 degrees, but to melt off at 55% formamide and 48 degrees. 
+# The minScore is the lowest score you would allow for pairwise alignments to remove potential probe:probe cross hybridization. -112 is roughly where 20 bp out of 60 bp align with one mismatch. This is probably overly conservative. Lastly, specify how many cores you want this code to run on.
+minFAm <- 30
+maxFAm <- 46
+GCmin <- 30
+GCmax <- 90
+minScore <- -112
+number_of_cores <- 4
+
+
+# OTHER PARAMETERS 
+# probe length should be close to 30
+probe_minLength <- 26
+probe_maxLength <- 32 
+# Permutations deal with small degeneracy between different sequences within the same target group. (ie, if you have multiple species within one group, you could create multiple probes to make sure you cover all species in the target group). However, we are aiming to create probes for each unique sequence, so permutations will not be needed in most future probe designs and so is set to 1 here.
+probe_Permutations <- 1
+# Experimental conditions for calculating probe hybridization efficiency 
+Na_Molar <- 0.9
+FA_percent <- 20
+# Scoring for the pairwise alignments
+gap_penalty <- 2
+gapExtension_penalty <- 10
+```
+
+# Loading libraries, functions
+```{r, message=FALSE, warning=FALSE}
+library(DECIPHER)
+library(tidyverse)
+library(stringr)
+library(TmCalculator)
+library(rmarkdown)
+
+# Get the GC% for a probe
+get_GC <- function(x) {
+  num_g <- str_count(x, "G")
+  num_c <- str_count(x, "C")
+  gc_content <- (num_g + num_c) / str_length(x) * 100 
+}
+
+dir.create(project)
+fas <- paste0(project, "/", unaligned.file)   # path of the unaligned fasta/q file
+```
+
+# Align
+```{r}
+# load the sequences from the file into a biostrings readable format and get sequences into the same orientation 
+seqs <- readDNAStringSet(fas) %>% OrientNucleotides()
+
+# perform the alignment
+aligned <- AlignSeqs(seqs)
+
+# view the alignment in a browser (optional)
+BrowseSeqs(aligned, highlight=0)
+
+# write the alignment to a new FASTA file
+writeXStringSet(aligned, file= aligned.file) # file named in line 8
+fasta <- aligned.file # same as above
+```
+
+
+# Prep your sequence db
+```{r}
+# pull the sequence identifier for each sequence. this is what's in the description line of each sequence in the fasta file (ex: ........)
+bacterial.names <- names(seqs)
+Number.of.species <- length(bacterial.names)
+
+# path to aligned file as a db
+db <-  dbConnect(SQLite(), ":memory:") # just store this db in memory. so far has only been tested with input file size of 11 kb (7 full length rRNA sequences)
+
+Seqs2DB(fasta, Format, db, the_identifier) # the identifier here is the general universal identifier 
+
+# for sequence specific identifiers: write the identifier information into a df so that it can be added to the seqs object
+identifier.df <- data.frame(row_names = 1:Number.of.species, identifier = bacterial.names)
+
+# add in the identifier df to the seqs db
+dbWriteTable(db, "Seqs", identifier.df, overwrite = TRUE)
+dbReadTable(db, "Seqs")
+
+```
+
+
+# Probe Design
+```{r}
+# This all takes a while, so let's time it
+start_time <- Sys.time()
+
+# create your tiles, which are overlapping segments from the main sequence. These tiles are the basis for the probes. 
+tiles <- TileSeqs(db, add2tbl="Tiles", minLength = probe_minLength, maxLength = probe_maxLength, maxTilePermutations = probe_Permutations)
+
+# Design probes for every bacterial identifier in your list (this is about 4 min per sequence). 
+# This function designs probes for every unique identifier. It also calculates the hybridization efficiency based off the experimental conditions you give it. Here, these are salt concentration at 0.9 M and formamide at 20%. This function outputs a csv with all the possible probes.
+Temp <- dir.create(paste0(project,"/Temp"))
+
+probe.design.apply <- function(bug) {
+  all.probes <- DesignProbes(tiles, identifier = bug, minLength = probe_minLength, 
+                             maxLength = probe_maxLength, 
+                            Na = Na_Molar, FA = FA_percent, maxPermutations = probe_Permutations) 
+  all.probes %>% filter(mismatches == "") %>% write.csv(paste0(project,"/Temp/Probes_", bug, ".csv"))
+}
+
+# Design probes for each bacteria in your list. This will write as many csv's as bacteria in your list. 
+mclapply(bacterial.names, probe.design.apply, mc.cores = number_of_cores)
+
+
+# Bring back in the csv and add extra probe metadata. Writing and reading the csv seems to solve the "df within a df" issue
+
+df.list <- list()
+for (bug in bacterial.names) {
+  df <- read.csv(paste0(project,"/Temp/Probes_", bug, ".csv")) # read in each csv made in the line above
+  df <- Filter(function(x)!all(is.na(x)), df) # get rid of unnecessary columns
+  # make a new column that has the length of the probe in it
+  df$len <- nchar(df$probe)
+  # add a column for GC%
+  df$GC <- sapply(df$probe, get_GC)
+  # add a column for Tm nearest neighbour. assumes 50 mM Na, 0 Tris, and no formamide
+  df$Tm_NN <- sapply(df$probe, Tm_NN, Na = Na_Molar*1000, outlist = FALSE)
+  # assign the df an id of the bacteria, and add the df to a list
+  df.list[[bug]] <- assign(bug, df)
+}
+
+# Now we have dfs for every bacteria with the probe sequence, efficiency, probe length, GC content, and Tm in a list
+
+# Filter these df's according to specific criteria
+
+filtered.list <- list()
+for (df in df.list) {
+ # filter based on formamide melting temp, these parameters were set at the top of the page
+ tmp.df <- df %>% filter(FAm <= maxFAm & FAm >= minFAm)
+ # filter based on GC content, these parameters were set at the top of the page
+ tmp.df <- tmp.df %>% filter(GC <= GCmax & GC >= GCmin)
+ filtered.list <- append(filtered.list, list(tmp.df))
+ }
+
+filtered.list[1]
+# Now we have our shortlist of probes for each bacteria
+
+end_time <- Sys.time()
+print(paste0("Designing probes for each unique bacteria took ", end_time - start_time, " minutes"))
+
+```
+
+# Design probe that hybridizes to all bacteria in the sample
+```{r}
+start_time <- Sys.time()
+
+probes.eub <- DesignProbes(tiles, minLength = 26, maxLength = 31, minCoverage = 0.95, Na = 0.9, FA = 20) # by not putting in an identifier, we are are listing all possible probes for bacteria 
+
+# keep only ones with mismatches
+probes.eub.mm <- probes.eub %>% filter(mismatches != "")
+
+# Each unique probe sequence, if it shows up as many times as the number of species you have, then it's a probe sequence that is found in each bacterium
+probes.for.all <- probes.eub.mm %>% group_by(probe[,1]) %>% summarize(count = n()) %>% filter(count == Number.of.species) # the probe column is a df within a df, so choose the first column which actually contains the probe sequence
+names(probes.for.all)[1] <- "eub"
+
+# look at characteristics of eub probes
+probes.eub.mm$probenew <- probes.eub.mm$probe[,1] # make a new column so that it's not a dataframe in a dataframe. csv workaround not needed here.
+probes.eub.short <- left_join(probes.for.all, probes.eub.mm, by = c("eub" = "probenew"))
+View(probes.eub.short)
+
+# Length of time to design a probe list that would work for all bacteria in your sample 
+end_time <- Sys.time()
+print(paste0("Designing eub probes took ", end_time - start_time, " minutes"))
+```
+
+# Add flanking regions to probes
+```{r}
+# Unify all probe options into one table
+probes_species <- bind_rows(filtered.list)
+
+# clean up tables
+probes_species <- probes_species[,-1]
+colnames(probes_species)[6:9] <- c("probe", "efficiency", "FAm", "coverage") # warning: position based functions could cause problems if permutation parameter changed
+
+colnames(probes.eub.short)[1] <- "identifier"
+probes.eub.short <- probes.eub.short[,-c(1:2)] 
+probes.eub.short <- probes.eub.short[,-10] 
+#add in metadata
+probes.eub.short$len <- nchar(probes.eub.short$probe[,1])
+probes.eub.short$GC <- sapply(probes.eub.short$probe[,1], get_GC)
+probes.eub.short$Tm_NN <- sapply(probes.eub.short$probe[,1], Tm_NN, Na = Na_Molar*1000, outlist = FALSE)
+
+# Now combine eub and species specific tables
+probes.eub.short$identifier <- "eub"
+probes.final <- rbind(probes.eub.short, probes_species)
+
+# Get flanking readout sequences
+get_flank <- function() {
+  randomseq <- sample(DNA_ALPHABET[1:4], size=15, replace=TRUE)
+  paste(randomseq, collapse="")
+}
+
+probes.final$flank <- replicate(dim(probes.final)[1], get_flank())
+
+#combine flanking sequences to the 5 prime and 3 prime ends. This can be adjusted for combinatorial labeling.
+
+probes.final$combined.probe <- paste0(probes.final$flank, probes.final$probe[,1] , probes.final$flank)
+View(probes.final)
+write.csv(probes.final, paste0(project,"/probes_final_longlist.csv"))
+```
+
+# make sure probe list doesn't have any cross-hybridizations
+```{r}
+# Now that our probes are much longer, we need to check again to make sure there's no cross hybridization 
+# Because we're working with ssDNA, we need to reverseComplement one of the sequences when looking for alignments that would correspond to hybridization. 
+# ie: 5' ATCG 3' would hybridize to 5' CGAT 3' , but to get it to align we need the revComp which is 5' ATCG 3'
+
+combined.probe.list <- probes.final$combined.probe
+
+ProbeHybTest <- function(probe) {
+  probe2 <- DNAString(probe) %>% Biostrings::reverseComplement()
+  pairwiseAlignment(DNAStringSet(combined.probe.list), probe2, gapOpening = gap_penalty, 
+                              gapExtension = gapExtension_penalty, type = "global", scoreOnly = TRUE)
+}
+
+list.of.scores <- mclapply(combined.probe.list, ProbeHybTest, mc.cores = number_of_cores)
+scores.df <- as.data.frame(do.call(cbind, list.of.scores))
+
+# If a row contains values > -112 (default minimum score), put T in the new column $CrossHyb
+rownames(scores.df) <- colnames(scores.df)
+
+booleanCrossHyb <- scores.df %>% summarise_if(is.numeric, max) > minScore
+scores.df$CrossHyb <- t(booleanCrossHyb)
+
+# Now add this boolean column to probes final table
+probes.final$CrossHyb <- scores.df$CrossHyb
+View(probes.final)
+
+# Technically, we could potentially have cross hybridizations here within the same identifier, which we wouldn't use multiple probes for anyways. so we could filter up above that cross-hybridization is only for probes of other identifiers
+
+# How many not cross-hybridized options do we have?
+filter(probes.final, CrossHyb == FALSE) %>% group_by(identifier) %>% summarize(n())
+
+# We end up with 1-17 potential probes per identifier. This wouldn't be so heavily filtered if we started off with more unique probes ahead of time. 
+
+probes.final.nocrosshyb <- filter(probes.final, CrossHyb == FALSE)
+View(probes.final.nocrosshyb)
+write.csv(probes.final.nocrosshyb, paste0(project,"/probes_final_shortlist.csv"))
+```
